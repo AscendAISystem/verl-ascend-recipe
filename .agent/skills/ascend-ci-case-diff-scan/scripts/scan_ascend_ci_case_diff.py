@@ -870,6 +870,13 @@ def render_report(report: dict) -> str:
     lines = [
         "# Ascend CI Workflow and Case Alignment Report",
         "",
+        "Read this report in order: Ignored Workflows, Scanned Workflows, UT Case Details, and ST Case Details.",
+        "",
+        (
+            "Within both UT Case Details and ST Case Details, cases are grouped into Matched Cases, "
+            "CPU/GPU-only Cases, NPU-only Cases, and Manual Review."
+        ),
+        "",
         f"## Ignored Workflows ({len(report['ignored_workflows'])})",
         "",
     ]

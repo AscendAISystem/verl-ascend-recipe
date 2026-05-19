@@ -18,24 +18,16 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import datetime as dt
-import hashlib
+import json
 import re
 import shlex
-from collections import Counter, defaultdict
+from collections import defaultdict
+from dataclasses import dataclass
+from fnmatch import fnmatch
 from itertools import zip_longest
 from pathlib import Path
-
-IGNORED_WORKFLOW_NAMES = {
-    "check-pr-title",
-    "doc",
-    "pre-commit",
-    "precommit-autofix",
-    "sanity",
-    "scorecard",
-    "secrets_scan",
-    "type-coverage-check",
-}
 
 ENV_PREFIX_RE = re.compile(r"^(?:[A-Za-z_][A-Za-z0-9_]*=(?:\"[^\"]*\"|'[^']*'|\S+)\s+)+")
 TORCHRUN_RE = re.compile(r"\btorchrun\b")
@@ -57,16 +49,30 @@ PYTEST_OPTIONS_WITH_VALUE = {
     "--durations",
 }
 IGNORED_CASE_TARGETS = {"tests/"}
+PYTEST_DIRECTORY_TARGETS = {"tests", "tests/"}
+UT_KIND = "ut"
+ST_KIND = "st"
+CASE_COMPARISON_SECTIONS = ("matched", "cpu_gpu_only", "npu_only", "manual_review")
+CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "workflow_scope.json"
+
+
+@dataclass(frozen=True)
+class WorkflowConfig:
+    ignored_workflows: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class WorkflowInfo:
+    workflow_name: str
+    workflow_path: str
+    file_name: str
+    workflow_kind: str
+    pair_key: str
 
 
 def normalize_path_text(value: str) -> str:
     """Normalize filesystem-like text so matching stays stable across platforms."""
     return value.replace("\\", "/").strip()
-
-
-def stable_id(*parts: str) -> str:
-    """Build a deterministic short identifier for report items."""
-    return hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()[:12]
 
 
 def load_text(path: Path) -> str:
@@ -79,25 +85,39 @@ def load_text(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="ignore")
 
 
-def should_ignore_workflow(workflow_name: str, workflow_path: Path) -> bool:
-    """Filter out repo workflows that are clearly not test execution workflows."""
-    stem = workflow_path.stem.lower()
-    name = workflow_name.strip().strip("\"'").lower()
-    return stem in IGNORED_WORKFLOW_NAMES or name in IGNORED_WORKFLOW_NAMES
+def load_config(config_path: Path = CONFIG_PATH) -> WorkflowConfig:
+    """Load the workflow-scope configuration from JSON."""
+    payload = json.loads(load_text(config_path))
+    ignored_workflows = tuple(payload.get("ignored_workflows", []))
+    return WorkflowConfig(ignored_workflows=ignored_workflows)
 
 
-def classify_workflow(workflow_name: str, workflow_path: Path, content: str) -> str | None:
-    """Classify a workflow into cpu/gpu/npu buckets based on stable naming signals."""
-    if should_ignore_workflow(workflow_name, workflow_path):
-        return None
-    stem = workflow_path.stem.lower()
+def is_ignored_workflow(file_name: str, config: WorkflowConfig) -> bool:
+    """Return whether the workflow file should be excluded from the scan."""
+    lowered = file_name.lower()
+    return any(fnmatch(lowered, pattern.lower()) for pattern in config.ignored_workflows)
+
+
+def classify_workflow(file_stem: str, content: str) -> str:
+    """Classify workflows into cpu, gpu, or npu buckets."""
+    stem = file_stem.lower()
     if stem == "cpu_unit_tests":
         return "cpu"
-    if stem.endswith("_ascend") or stem == "npu_unit_tests" or "nightly_ascend" in stem:
+    if stem == "npu_unit_tests" or stem.endswith("_ascend") or "nightly_ascend" in stem:
         return "npu"
     if RUNS_ON_ASCEND_RE.search(content) or IMAGE_ASCEND_RE.search(content):
         return "npu"
     return "gpu"
+
+
+def workflow_pair_key(file_stem: str) -> str:
+    """Map workflow file names into CPU/GPU vs NPU pairing groups."""
+    stem = file_stem.lower()
+    if stem == "npu_unit_tests":
+        return "gpu_unit_tests"
+    if stem.endswith("_ascend"):
+        return stem[: -len("_ascend")]
+    return stem
 
 
 def normalize_signature(command: str, target: str) -> str:
@@ -109,8 +129,6 @@ def normalize_signature(command: str, target: str) -> str:
     env_match = ENV_PREFIX_RE.match(prefix or "")
     env_prefix = env_match.group(0).strip() if env_match else ""
     parts: list[str] = []
-    # Preserve only high-signal environment knobs to avoid treating every
-    # incidental argument difference as a distinct workflow case.
     for key in ("ROLLOUT_NAME", "ENGINE", "STRATEGY", "MODE", "RESUME_MODE", "BACKEND"):
         match = re.search(rf"{key}=([^\s]+)", env_prefix)
         if match:
@@ -123,23 +141,36 @@ def normalize_signature(command: str, target: str) -> str:
 
 
 def split_shell_commands(command: str) -> list[str]:
-    """Split a shell line on semicolons while respecting simple quote scopes."""
+    """Split a shell line on common shell separators while respecting simple quote scopes."""
     parts: list[str] = []
     current: list[str] = []
     in_single = False
     in_double = False
-    for ch in command:
+    idx = 0
+    while idx < len(command):
+        ch = command[idx]
         if ch == "'" and not in_double:
             in_single = not in_single
         elif ch == '"' and not in_single:
             in_double = not in_double
-        if ch == ";" and not in_single and not in_double:
-            part = "".join(current).strip()
-            if part:
-                parts.append(part)
-            current = []
-            continue
+        if not in_single and not in_double:
+            separator = None
+            if ch == ";":
+                separator = ";"
+            elif command.startswith("&&", idx):
+                separator = "&&"
+            elif command.startswith("||", idx):
+                separator = "||"
+            if separator is not None:
+                part = "".join(current).strip()
+                if part:
+                    parts.append(part)
+                current = []
+                idx += len(separator)
+                continue
+
         current.append(ch)
+        idx += 1
     tail = "".join(current).strip()
     if tail:
         parts.append(tail)
@@ -152,6 +183,43 @@ def tokenize_command(command: str) -> list[str]:
         return shlex.split(command, posix=True)
     except ValueError:
         return command.split()
+
+
+def extract_step_python_file_patterns(run_entries: list[tuple[str, int]]) -> list[str]:
+    """Extract pytest file-name filters configured earlier in the same run block."""
+    patterns: list[str] = []
+    for raw, _line_number in run_entries:
+        match = re.search(r"python_files\s*=\s*([^\s'\"`]+)", raw)
+        if match:
+            patterns.append(match.group(1).strip())
+    return patterns
+
+
+def extract_pytest_ignore_specs(tokens: list[str], pytest_idx: int) -> tuple[list[str], list[str]]:
+    """Extract ignore path and ignore glob options from a pytest command."""
+    ignore_paths: list[str] = []
+    ignore_globs: list[str] = []
+    idx = pytest_idx + 1
+    while idx < len(tokens):
+        token = tokens[idx]
+        if token in PATH_VALUE_OPTIONS and idx + 1 < len(tokens):
+            value = normalize_path_text(tokens[idx + 1].strip("\"'"))
+            if token == "--ignore":
+                ignore_paths.append(value)
+            else:
+                ignore_globs.append(value)
+            idx += 2
+            continue
+        if token.startswith("--ignore="):
+            ignore_paths.append(normalize_path_text(token.split("=", 1)[1].strip("\"'")))
+            idx += 1
+            continue
+        if token.startswith("--ignore-glob="):
+            ignore_globs.append(normalize_path_text(token.split("=", 1)[1].strip("\"'")))
+            idx += 1
+            continue
+        idx += 1
+    return ignore_paths, ignore_globs
 
 
 def extract_pytest_targets(tokens: list[str], pytest_idx: int) -> list[str]:
@@ -176,7 +244,7 @@ def extract_pytest_targets(tokens: list[str], pytest_idx: int) -> list[str]:
             idx += 1
             continue
         normalized = normalize_path_text(token.strip("\"'"))
-        if normalized.startswith("tests/"):
+        if normalized in PYTEST_DIRECTORY_TARGETS or normalized.startswith("tests/"):
             targets.append(normalized)
         idx += 1
     return targets
@@ -212,9 +280,103 @@ def extract_bash_target(tokens: list[str]) -> str | None:
     return None
 
 
-def should_keep_target(target: str) -> bool:
+def should_keep_target(target: str, command_type: str) -> bool:
     """Drop placeholder paths that do not identify a real test case."""
-    return target not in IGNORED_CASE_TARGETS
+    normalized_target = normalize_path_text(target)
+    return (command_type == "pytest" and normalized_target in PYTEST_DIRECTORY_TARGETS) or (
+        normalized_target not in IGNORED_CASE_TARGETS
+    )
+
+
+def matches_python_file_patterns(path_text: str, python_file_patterns: list[str]) -> bool:
+    """Check whether a discovered file name matches the configured pytest file patterns."""
+    file_name = Path(path_text).name
+    if not python_file_patterns:
+        return fnmatch(file_name, "test_*.py")
+    return any(fnmatch(file_name, pattern) for pattern in python_file_patterns)
+
+
+def is_ignored_pytest_target(path_text: str, ignore_paths: list[str], ignore_globs: list[str]) -> bool:
+    """Check whether a discovered test file should be excluded by pytest ignore options."""
+    normalized = normalize_path_text(path_text)
+    for ignore_path in ignore_paths:
+        candidate = normalize_path_text(ignore_path)
+        if normalized == candidate or normalized.startswith(candidate.rstrip("/") + "/"):
+            return True
+    return any(fnmatch(normalized, pattern) for pattern in ignore_globs)
+
+
+def extract_test_functions_from_file(path: Path) -> list[str]:
+    """Extract unittest-style and pytest-style test functions from one Python file."""
+    try:
+        module = ast.parse(load_text(path))
+    except SyntaxError:
+        return []
+
+    names: list[str] = []
+    for node in module.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test_"):
+            names.append(node.name)
+        elif isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
+            for child in node.body:
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) and child.name.startswith("test_"):
+                    names.append(f"{node.name}::{child.name}")
+    return sorted(dict.fromkeys(names))
+
+
+def expand_python_test_file(path_text: str, repo_root: Path) -> list[str]:
+    """Expand one Python test file into function-level UT identifiers."""
+    path = repo_root / path_text
+    if not path.is_file():
+        return [path_text]
+    functions = extract_test_functions_from_file(path)
+    if not functions:
+        return [path_text]
+    return [f"{path_text}::{function_name}" for function_name in functions]
+
+
+def expand_pytest_directory(
+    target_path: Path,
+    repo_root: Path,
+    python_file_patterns: list[str],
+    ignore_paths: list[str],
+    ignore_globs: list[str],
+) -> list[str]:
+    """Expand one pytest directory target using pattern-based Python file discovery."""
+    expanded: list[str] = []
+    for path in sorted(target_path.rglob("*.py")):
+        if not path.is_file():
+            continue
+        path_text = normalize_path_text(path.relative_to(repo_root).as_posix())
+        if not matches_python_file_patterns(path_text, python_file_patterns):
+            continue
+        if is_ignored_pytest_target(path_text, ignore_paths, ignore_globs):
+            continue
+        expanded.extend(expand_python_test_file(path_text, repo_root))
+    return expanded
+
+
+def expand_pytest_targets(
+    target: str,
+    repo_root: Path,
+    python_file_patterns: list[str],
+    ignore_paths: list[str],
+    ignore_globs: list[str],
+) -> list[str]:
+    """Expand pytest targets into function-level UT cases."""
+    normalized = normalize_path_text(target)
+    target_path = repo_root / normalized
+    if target_path.is_dir():
+        return expand_pytest_directory(
+            target_path,
+            repo_root,
+            python_file_patterns,
+            ignore_paths,
+            ignore_globs,
+        )
+    if normalized.endswith(".py"):
+        return expand_python_test_file(normalized, repo_root)
+    return [normalized]
 
 
 def dedupe_case_candidates(cases: list[dict]) -> list[dict]:
@@ -222,7 +384,7 @@ def dedupe_case_candidates(cases: list[dict]) -> list[dict]:
     seen = set()
     deduped = []
     for case in cases:
-        key = (case["command_type"], case["target"], case["signature"])
+        key = (case["command_type"], tuple(case["targets"]), case["signature"], case["raw_command"])
         if key in seen:
             continue
         seen.add(key)
@@ -230,7 +392,11 @@ def dedupe_case_candidates(cases: list[dict]) -> list[dict]:
     return deduped
 
 
-def extract_cases_from_command(command: str) -> list[dict]:
+def extract_cases_from_command(
+    command: str,
+    repo_root: Path,
+    python_file_patterns: list[str] | None = None,
+) -> list[dict]:
     """Turn one shell command into one or more normalized workflow case records."""
     command = command.strip()
     if not command or command.startswith("#"):
@@ -242,11 +408,13 @@ def extract_cases_from_command(command: str) -> list[dict]:
 
     cases: list[dict] = []
     bash_target = extract_bash_target(tokens)
-    if bash_target and should_keep_target(bash_target):
+    if bash_target and should_keep_target(bash_target, "bash"):
         cases.append(
             {
-                "command_type": "bash_script",
+                "command_type": "bash",
+                "case_kind": ST_KIND,
                 "target": bash_target,
+                "targets": [bash_target],
                 "raw_command": command,
                 "signature": normalize_signature(command, bash_target),
             }
@@ -255,43 +423,100 @@ def extract_cases_from_command(command: str) -> list[dict]:
     if "torchrun" in tokens or TORCHRUN_RE.search(command):
         torchrun_idx = tokens.index("torchrun") if "torchrun" in tokens else 0
         for target in extract_torchrun_targets(tokens, torchrun_idx):
-            if not should_keep_target(target):
+            if not should_keep_target(target, "torchrun"):
                 continue
             cases.append(
                 {
                     "command_type": "torchrun",
+                    "case_kind": ST_KIND,
                     "target": target,
+                    "targets": [target],
                     "raw_command": command,
                     "signature": normalize_signature(command, target),
                 }
             )
     elif "pytest" in tokens:
         pytest_idx = tokens.index("pytest")
+        ignore_paths, ignore_globs = extract_pytest_ignore_specs(tokens, pytest_idx)
         for target in extract_pytest_targets(tokens, pytest_idx):
-            if not should_keep_target(target):
+            if not should_keep_target(target, "pytest"):
                 continue
+            normalized_target = normalize_path_text(target)
+            if normalized_target in PYTEST_DIRECTORY_TARGETS or Path(normalized_target).suffix == "":
+                target_shape = "pytest-dir"
+            elif normalized_target.endswith(".py"):
+                target_shape = "pytest-file"
+            else:
+                target_shape = "pytest-target"
+
+            signature = normalize_signature(command, target)
+            if signature:
+                signature = f"{signature} {target_shape}"
+            else:
+                signature = target_shape
+
             cases.append(
                 {
                     "command_type": "pytest",
+                    "case_kind": UT_KIND,
                     "target": target,
+                    "targets": expand_pytest_targets(
+                        target,
+                        repo_root,
+                        python_file_patterns or [],
+                        ignore_paths,
+                        ignore_globs,
+                    ),
                     "raw_command": command,
-                    "signature": normalize_signature(command, target),
+                    "signature": signature,
                 }
             )
 
     return dedupe_case_candidates(cases)
 
 
-def parse_workflow(path: Path, repo_root: Path) -> tuple[list[dict], str | None]:
+def build_case_id(case: dict) -> str:
+    """Build a per-occurrence case key that preserves workflow/job/step distinctions."""
+    return "|".join(
+        [
+            case["case_kind"],
+            case["command_type"],
+            case["target"],
+            case["signature"],
+            case["workflow_name"],
+            case["job_name"],
+            case["step_name"],
+            str(case["line_number"]),
+        ]
+    )
+
+
+def build_display_name(case: dict) -> str:
+    """Produce the report-facing case name for UT and ST entries."""
+    if case["case_kind"] == UT_KIND:
+        return case["target"]
+    return f"{case['target']} [{case['workflow_name']} / {case['job_name']} / {case['step_name']}]"
+
+
+def parse_workflow(path: Path, repo_root: Path, config: WorkflowConfig) -> tuple[WorkflowInfo | None, list[dict]]:
     """Parse one workflow file and extract test cases from each run block."""
+    file_name = path.name
+    if is_ignored_workflow(file_name, config):
+        return None, []
+
     content = load_text(path)
     workflow_name = path.stem
     name_match = WORKFLOW_NAME_RE.search(content)
     if name_match:
         workflow_name = name_match.group(1).strip().strip("\"'")
-    workflow_kind = classify_workflow(workflow_name, path, content)
-    if workflow_kind is None:
-        return [], None
+    workflow_kind = classify_workflow(path.stem, content)
+    workflow_info = WorkflowInfo(
+        workflow_name=workflow_name,
+        workflow_path=normalize_path_text(path.relative_to(repo_root).as_posix()),
+        file_name=file_name,
+        workflow_kind=workflow_kind,
+        pair_key=workflow_pair_key(path.stem),
+    )
 
     lines = content.splitlines()
     job_name = "unknown"
@@ -314,8 +539,6 @@ def parse_workflow(path: Path, repo_root: Path) -> tuple[list[dict], str | None]
             if inline and inline not in {"|", ">"}:
                 run_entries.append((inline, idx + 1))
             idx += 1
-            # Consume the indented body of the run block so each physical line
-            # can later be mapped back to its original workflow line number.
             while idx < len(lines):
                 next_line = lines[idx]
                 next_indent = len(next_line) - len(next_line.lstrip(" "))
@@ -327,40 +550,90 @@ def parse_workflow(path: Path, repo_root: Path) -> tuple[list[dict], str | None]
                 stripped = next_line[indent + 2 :] if len(next_line) >= indent + 2 else next_line.lstrip()
                 run_entries.append((stripped, idx + 1))
                 idx += 1
+            python_file_patterns = extract_step_python_file_patterns(run_entries)
             for raw, line_number in run_entries:
                 for command in split_shell_commands(raw):
-                    for case in extract_cases_from_command(command):
-                        case.update(
-                            {
+                    for case in extract_cases_from_command(command, repo_root, python_file_patterns):
+                        for target in case["targets"]:
+                            expanded_case = {
                                 "workflow_name": workflow_name,
-                                "workflow_path": normalize_path_text(path.relative_to(repo_root).as_posix()),
+                                "workflow_path": workflow_info.workflow_path,
+                                "file_name": file_name,
                                 "workflow_kind": workflow_kind,
+                                "pair_key": workflow_info.pair_key,
                                 "job_name": job_name,
                                 "step_name": step_name,
                                 "line_number": line_number,
+                                "command_type": case["command_type"],
+                                "case_kind": case["case_kind"],
+                                "target": target,
+                                "raw_command": case["raw_command"],
+                                "signature": case["signature"],
                             }
-                        )
-                        cases.append(case)
+                            expanded_case["case_id"] = build_case_id(expanded_case)
+                            expanded_case["display_name"] = build_display_name(expanded_case)
+                            cases.append(expanded_case)
             continue
         idx += 1
-    return cases, workflow_kind
+    return workflow_info, cases
 
 
-def collect_workflow_cases(repo_root: Path) -> tuple[list[dict], list[str]]:
-    """Scan every workflow file under .github/workflows and aggregate extracted cases."""
+def collect_scan_data(repo_root: Path, config: WorkflowConfig) -> tuple[list[WorkflowInfo], list[dict], list[str]]:
+    """Scan workflows and return parsed workflow metadata, cases, and ignored paths."""
     workflow_dir = repo_root / ".github" / "workflows"
+    workflow_infos: list[WorkflowInfo] = []
     cases: list[dict] = []
-    sources: list[str] = []
+    ignored_paths: list[str] = []
     for path in sorted(workflow_dir.glob("*.yml")):
-        sources.append(normalize_path_text(path.relative_to(repo_root).as_posix()))
-        workflow_cases, _ = parse_workflow(path, repo_root)
+        rel_path = normalize_path_text(path.relative_to(repo_root).as_posix())
+        if is_ignored_workflow(path.name, config):
+            ignored_paths.append(rel_path)
+            continue
+        workflow_info, workflow_cases = parse_workflow(path, repo_root, config)
+        if workflow_info is None:
+            ignored_paths.append(rel_path)
+            continue
+        workflow_infos.append(workflow_info)
         cases.extend(workflow_cases)
-    return cases, sources
+    return workflow_infos, cases, ignored_paths
 
 
-def ref_from_case(case: dict) -> dict:
-    """Keep only the fields needed for a human-readable report reference."""
+def build_workflow_groups(workflow_infos: list[WorkflowInfo]) -> dict[str, dict[str, list[WorkflowInfo]]]:
+    """Group workflows by their CPU/GPU vs NPU pairing key."""
+    grouped: dict[str, dict[str, list[WorkflowInfo]]] = defaultdict(lambda: {"cpu_gpu": [], "npu": []})
+    for info in workflow_infos:
+        side = "npu" if info.workflow_kind == "npu" else "cpu_gpu"
+        grouped[info.pair_key][side].append(info)
+    return grouped
+
+
+def summarize_scanned_workflows(
+    grouped_workflows: dict[str, dict[str, list[WorkflowInfo]]], cases: list[dict]
+) -> list[dict]:
+    """Build table rows for scanned workflow coverage counts."""
+    rows: list[dict] = []
+    for pair_key, workflows in sorted(grouped_workflows.items()):
+        cpu_gpu_paths = {info.workflow_path for info in workflows["cpu_gpu"]}
+        npu_paths = {info.workflow_path for info in workflows["npu"]}
+        cpu_gpu_case_ids = {case["case_id"] for case in cases if case["workflow_path"] in cpu_gpu_paths}
+        npu_case_ids = {case["case_id"] for case in cases if case["workflow_path"] in npu_paths}
+        workflow_names = [
+            f"{info.workflow_path} ({info.workflow_name})" for info in workflows["cpu_gpu"] + workflows["npu"]
+        ]
+        rows.append(
+            {
+                "workflow_name": "<br>".join(sorted(workflow_names)) if workflow_names else pair_key,
+                "cpu_gpu_case_count": len(cpu_gpu_case_ids),
+                "npu_supported_case_count": len(npu_case_ids),
+            }
+        )
+    return rows
+
+
+def make_ref(case: dict) -> dict:
+    """Keep only the fields needed for report rendering."""
     return {
+        "name": case["display_name"],
         "workflow_name": case["workflow_name"],
         "workflow_path": case["workflow_path"],
         "job_name": case["job_name"],
@@ -370,175 +643,6 @@ def ref_from_case(case: dict) -> dict:
     }
 
 
-def build_case_index(cases: list[dict]) -> dict[tuple[str, str], list[dict]]:
-    """Index cases by command kind and target for coarse parity matching."""
-    index: dict[tuple[str, str], list[dict]] = defaultdict(list)
-    for case in cases:
-        index[(case["command_type"], case["target"])].append(case)
-    return index
-
-
-def signature_set(cases: list[dict]) -> set[str]:
-    """Collect distinct normalized signatures from a case list."""
-    return {case["signature"] for case in cases}
-
-
-def group_cases_by_signature(cases: list[dict]) -> dict[str, list[dict]]:
-    """Group cases by normalized signature so exact and partial matches can be separated."""
-    grouped: dict[str, list[dict]] = defaultdict(list)
-    for case in cases:
-        grouped[case["signature"]].append(case)
-    return grouped
-
-
-def display_signature(signature: str) -> str:
-    """Render empty signatures explicitly to avoid ambiguous report output."""
-    return signature if signature else "<none>"
-
-
-def format_signature_summary(prefix: str, signatures: list[str]) -> str:
-    """Format a labeled signature summary for manual review report entries."""
-    rendered = ", ".join(display_signature(signature) for signature in signatures)
-    return f"{prefix}={rendered}"
-
-
-def compare_case_sets(cpu_gpu_cases: list[dict], npu_cases: list[dict]) -> list[dict]:
-    """Compare baseline CPU/GPU cases against NPU cases and build report items."""
-    cpu_gpu_index = build_case_index(cpu_gpu_cases)
-    npu_index = build_case_index(npu_cases)
-    items: list[dict] = []
-
-    for key, baseline_cases in sorted(cpu_gpu_index.items()):
-        command_type, target = key
-        npu_matches = npu_index.get(key, [])
-        if not npu_matches:
-            items.append(
-                {
-                    "id": stable_id("missing", command_type, target),
-                    "category": "missing_in_npu_workflows",
-                    "command_type": command_type,
-                    "target": target,
-                    "signature": "",
-                    "cpu_gpu_refs": [ref_from_case(case) for case in baseline_cases],
-                    "npu_refs": [],
-                    "reason": "CPU/GPU workflow case has no NPU workflow match.",
-                    "confidence": "high",
-                }
-            )
-            continue
-
-        baseline_by_signature = group_cases_by_signature(baseline_cases)
-        npu_by_signature = group_cases_by_signature(npu_matches)
-
-        # First emit exact signature matches. Any remaining unmatched signatures
-        # become manual-review candidates instead of being forced into aligned.
-        shared_signatures = sorted(set(baseline_by_signature) & set(npu_by_signature))
-        for signature in shared_signatures:
-            items.append(
-                {
-                    "id": stable_id("aligned", command_type, target, signature),
-                    "category": "aligned",
-                    "command_type": command_type,
-                    "target": target,
-                    "signature": signature,
-                    "cpu_gpu_refs": [ref_from_case(case) for case in baseline_by_signature[signature]],
-                    "npu_refs": [ref_from_case(case) for case in npu_by_signature[signature]],
-                    "reason": "Matching target and compatible signatures found in NPU workflows.",
-                    "confidence": "high",
-                }
-            )
-
-        baseline_only_signatures = sorted(set(baseline_by_signature) - set(npu_by_signature))
-        npu_only_signatures = sorted(set(npu_by_signature) - set(baseline_by_signature))
-        if baseline_only_signatures or npu_only_signatures:
-            unmatched_baseline_cases = [
-                case for signature in baseline_only_signatures for case in baseline_by_signature[signature]
-            ]
-            unmatched_npu_cases = [case for signature in npu_only_signatures for case in npu_by_signature[signature]]
-            items.append(
-                {
-                    "id": stable_id(
-                        "manual",
-                        command_type,
-                        target,
-                        "|".join(baseline_only_signatures),
-                        "|".join(npu_only_signatures),
-                    ),
-                    "category": "manual_review_needed",
-                    "command_type": command_type,
-                    "target": target,
-                    "signature": " | ".join(
-                        part
-                        for part in (
-                            format_signature_summary("baseline-only", baseline_only_signatures)
-                            if baseline_only_signatures
-                            else "",
-                            format_signature_summary("npu-only", npu_only_signatures) if npu_only_signatures else "",
-                        )
-                        if part
-                    ),
-                    "cpu_gpu_refs": [ref_from_case(case) for case in unmatched_baseline_cases],
-                    "npu_refs": [ref_from_case(case) for case in unmatched_npu_cases],
-                    "reason": (
-                        "Target exists in both baseline and NPU workflows, "
-                        "but some command signatures remain unmatched."
-                    ),
-                    "confidence": "medium",
-                }
-            )
-
-    for key, npu_only_cases in sorted(npu_index.items()):
-        if key in cpu_gpu_index:
-            continue
-        command_type, target = key
-        items.append(
-            {
-                "id": stable_id("npu-only", command_type, target),
-                "category": "npu_only",
-                "command_type": command_type,
-                "target": target,
-                "signature": ", ".join(sorted(sig for sig in signature_set(npu_only_cases) if sig)),
-                "cpu_gpu_refs": [],
-                "npu_refs": [ref_from_case(case) for case in npu_only_cases],
-                "reason": "Case appears only in NPU workflows.",
-                "confidence": "high",
-            }
-        )
-
-    return items
-
-
-def build_summary(
-    case_items: list[dict],
-    cpu_gpu_cases: list[dict],
-    npu_cases: list[dict],
-) -> dict:
-    """Compute top-level counts using deduplicated case identities."""
-    counts = Counter(item["category"] for item in case_items)
-    return {
-        "cpu_gpu_cases": len({(case["command_type"], case["target"], case["signature"]) for case in cpu_gpu_cases}),
-        "npu_cases": len({(case["command_type"], case["target"], case["signature"]) for case in npu_cases}),
-        "aligned": counts["aligned"],
-        "missing_in_npu_workflows": counts["missing_in_npu_workflows"],
-        "manual_review_needed": counts["manual_review_needed"],
-        "npu_only": counts["npu_only"],
-    }
-
-
-def render_ref_block(title: str, refs: list[dict]) -> list[str]:
-    """Render a sorted block of workflow references for one side of the comparison."""
-    lines = [f"  - {title}:"]
-    if not refs:
-        lines.append("    - None")
-        return lines
-    for ref in sorted(
-        refs,
-        key=lambda item: (item["raw_command"], item["workflow_path"], item["line_number"]),
-    ):
-        lines.extend(render_reference_details("    ", "Reference", ref))
-    return lines
-
-
 def render_reference_details(indent: str, label: str, ref: dict | None) -> list[str]:
     """Render one workflow location with enough context for manual navigation."""
     lines = [f"{indent}- {label}:"]
@@ -546,83 +650,227 @@ def render_reference_details(indent: str, label: str, ref: dict | None) -> list[
         lines.append(f"{indent}  - None")
         return lines
     lines.append(f"{indent}  - Workflow file: `{ref['workflow_path']}`")
-    lines.append(f"{indent}  - Line: `{ref['line_number']}`")
+    lines.append(f"{indent}  - Line number: `{ref['line_number']}`")
     lines.append(f"{indent}  - Workflow context: `{ref['workflow_name']} / {ref['job_name']} / {ref['step_name']}`")
     lines.append(f"{indent}  - Command: `{ref['raw_command']}`")
     return lines
 
 
-def render_manual_review_block(item: dict) -> list[str]:
-    """Render CPU/GPU and NPU references in adjacent pairs for easier review."""
-    cpu_gpu_refs = sorted(
-        item["cpu_gpu_refs"],
-        key=lambda ref: (ref["raw_command"], ref["workflow_path"], ref["line_number"]),
-    )
-    npu_refs = sorted(
-        item["npu_refs"],
-        key=lambda ref: (ref["raw_command"], ref["workflow_path"], ref["line_number"]),
-    )
-
-    lines = ["  - Comparison context:"]
+def render_adjacent_pairs(cpu_gpu_refs: list[dict], npu_refs: list[dict]) -> list[str]:
+    """Render CPU/GPU and NPU references next to each other."""
+    lines: list[str] = []
     if not cpu_gpu_refs and not npu_refs:
-        lines.append("    - None")
+        lines.append("  - None")
         return lines
+    sorted_cpu_gpu = sorted(cpu_gpu_refs, key=lambda item: (item["name"], item["workflow_path"], item["line_number"]))
+    sorted_npu = sorted(npu_refs, key=lambda item: (item["name"], item["workflow_path"], item["line_number"]))
+    for index, (cpu_gpu_ref, npu_ref) in enumerate(zip_longest(sorted_cpu_gpu, sorted_npu), start=1):
+        lines.append(f"  - Pair {index}")
+        lines.extend(render_reference_details("    ", "CPU/GPU", cpu_gpu_ref))
+        lines.extend(render_reference_details("    ", "NPU", npu_ref))
+    return lines
 
-    for idx, (cpu_gpu_ref, npu_ref) in enumerate(zip_longest(cpu_gpu_refs, npu_refs), start=1):
-        lines.append(f"    - Pair {idx}:")
-        lines.extend(render_reference_details("      ", "CPU/GPU reference", cpu_gpu_ref))
-        lines.extend(render_reference_details("      ", "NPU reference", npu_ref))
+
+def compare_group_cases(cpu_gpu_cases: list[dict], npu_cases: list[dict]) -> dict[str, list[dict]]:
+    """Compare CPU/GPU and NPU cases inside one UT/ST bucket."""
+    grouped_cpu_gpu: dict[tuple[str, str, str], list[dict]] = defaultdict(list)
+    grouped_npu: dict[tuple[str, str, str], list[dict]] = defaultdict(list)
+    results = {section_name: [] for section_name in CASE_COMPARISON_SECTIONS}
+
+    for case in cpu_gpu_cases:
+        grouped_cpu_gpu[(case["command_type"], case["target"], case["signature"])].append(case)
+    for case in npu_cases:
+        grouped_npu[(case["command_type"], case["target"], case["signature"])].append(case)
+
+    cpu_gpu_base_index: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    npu_base_index: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    for case in cpu_gpu_cases:
+        cpu_gpu_base_index[(case["command_type"], case["target"])].append(case)
+    for case in npu_cases:
+        npu_base_index[(case["command_type"], case["target"])].append(case)
+
+    matched_keys = sorted(set(grouped_cpu_gpu) & set(grouped_npu))
+    for key in matched_keys:
+        command_type, target, signature = key
+        results["matched"].append(
+            {
+                "name": target,
+                "command_type": command_type,
+                "signature": signature,
+                "cpu_gpu_refs": [make_ref(case) for case in grouped_cpu_gpu[key]],
+                "npu_refs": [make_ref(case) for case in grouped_npu[key]],
+            }
+        )
+
+    processed_base_keys = set()
+    for base_key in sorted(set(cpu_gpu_base_index) | set(npu_base_index)):
+        command_type, target = base_key
+        cpu_gpu_signatures = {case["signature"] for case in cpu_gpu_base_index.get(base_key, [])}
+        npu_signatures = {case["signature"] for case in npu_base_index.get(base_key, [])}
+        shared_signatures = cpu_gpu_signatures & npu_signatures
+        only_cpu_gpu_signatures = cpu_gpu_signatures - shared_signatures
+        only_npu_signatures = npu_signatures - shared_signatures
+        if only_cpu_gpu_signatures and only_npu_signatures:
+            results["manual_review"].append(
+                {
+                    "name": target,
+                    "command_type": command_type,
+                    "signature": "",
+                    "cpu_gpu_refs": [
+                        make_ref(case)
+                        for case in cpu_gpu_base_index[base_key]
+                        if case["signature"] in only_cpu_gpu_signatures
+                    ],
+                    "npu_refs": [
+                        make_ref(case) for case in npu_base_index[base_key] if case["signature"] in only_npu_signatures
+                    ],
+                }
+            )
+            processed_base_keys.add(base_key)
+
+    for base_key in sorted(set(cpu_gpu_base_index) - processed_base_keys):
+        command_type, target = base_key
+        cpu_gpu_signatures = {case["signature"] for case in cpu_gpu_base_index[base_key]}
+        npu_signatures = {case["signature"] for case in npu_base_index.get(base_key, [])}
+        unmatched_signatures = cpu_gpu_signatures - npu_signatures
+        if not unmatched_signatures:
+            continue
+        results["cpu_gpu_only"].append(
+            {
+                "name": target,
+                "command_type": command_type,
+                "signature": "",
+                "cpu_gpu_refs": [
+                    make_ref(case) for case in cpu_gpu_base_index[base_key] if case["signature"] in unmatched_signatures
+                ],
+                "npu_refs": [],
+            }
+        )
+
+    for base_key in sorted(set(npu_base_index) - processed_base_keys):
+        command_type, target = base_key
+        npu_signatures = {case["signature"] for case in npu_base_index[base_key]}
+        cpu_gpu_signatures = {case["signature"] for case in cpu_gpu_base_index.get(base_key, [])}
+        unmatched_signatures = npu_signatures - cpu_gpu_signatures
+        if not unmatched_signatures:
+            continue
+        results["npu_only"].append(
+            {
+                "name": target,
+                "command_type": command_type,
+                "signature": "",
+                "cpu_gpu_refs": [],
+                "npu_refs": [
+                    make_ref(case) for case in npu_base_index[base_key] if case["signature"] in unmatched_signatures
+                ],
+            }
+        )
+
+    for section_name in CASE_COMPARISON_SECTIONS:
+        results[section_name] = sorted(results[section_name], key=lambda item: (item["name"], item["command_type"]))
+    return results
+
+
+def compare_cases_by_pair(cases: list[dict], case_kind: str) -> dict[str, list[dict]]:
+    """Compare cases inside each workflow pairing group and merge the results."""
+    aggregated = {section_name: [] for section_name in CASE_COMPARISON_SECTIONS}
+    pair_keys = sorted({case["pair_key"] for case in cases})
+    for pair_key in pair_keys:
+        pair_cases = [case for case in cases if case["pair_key"] == pair_key and case["case_kind"] == case_kind]
+        cpu_gpu_cases = [case for case in pair_cases if case["workflow_kind"] in {"cpu", "gpu"}]
+        npu_cases = [case for case in pair_cases if case["workflow_kind"] == "npu"]
+        comparison = compare_group_cases(cpu_gpu_cases, npu_cases)
+        for section_name in CASE_COMPARISON_SECTIONS:
+            aggregated[section_name].extend(comparison[section_name])
+    for section_name in CASE_COMPARISON_SECTIONS:
+        aggregated[section_name] = sorted(
+            aggregated[section_name],
+            key=lambda item: (item["name"], item["command_type"]),
+        )
+    return aggregated
+
+
+def render_table(headers: list[str], rows: list[list[str]]) -> list[str]:
+    """Render a Markdown table."""
+    lines = [
+        "| " + " | ".join(headers) + " |",
+        "| " + " | ".join(["---"] * len(headers)) + " |",
+    ]
+    for row in rows:
+        lines.append("| " + " | ".join(row) + " |")
+    return lines
+
+
+def render_case_section(title: str, items: list[dict]) -> list[str]:
+    """Render one details subsection."""
+    lines = [f"### {title}", ""]
+    if not items:
+        lines.append("- None")
+        lines.append("")
+        return lines
+    for item in items:
+        lines.append(f"- Case path: `{item['name']}`")
+        lines.extend(render_adjacent_pairs(item["cpu_gpu_refs"], item["npu_refs"]))
+    lines.append("")
+    return lines
+
+
+def render_details_block(title: str, comparison: dict[str, list[dict]]) -> list[str]:
+    """Render UT or ST comparison details in the requested order."""
+    lines = [f"## {title}", ""]
+    lines.extend(render_case_section("Matched Cases", comparison["matched"]))
+    lines.extend(render_case_section("CPU/GPU-only Cases", comparison["cpu_gpu_only"]))
+    lines.extend(render_case_section("NPU-only Cases", comparison["npu_only"]))
+    lines.extend(render_case_section("Manual Review", comparison["manual_review"]))
     return lines
 
 
 def render_report(report: dict) -> str:
-    """Render the final Markdown report consumed by developers."""
-    summary = report["summary"]
-    by_category: dict[str, list[dict]] = defaultdict(list)
-    for item in report["items"]:
-        by_category[item["category"]].append(item)
-
+    """Render the final Markdown report."""
     lines = [
-        "# Ascend CI Case Diff Scan Report",
+        "# Ascend CI Workflow and Case Alignment Report",
         "",
-        "## Summary",
+        "Read this report in order: Ignored Workflows, Scanned Workflows, UT Case Details, and ST Case Details.",
         "",
-        f"- CPU/GPU workflow cases: {summary['cpu_gpu_cases']}",
-        f"- NPU workflow cases: {summary['npu_cases']}",
-        f"- aligned: {summary['aligned']}",
-        f"- missing_in_npu_workflows: {summary['missing_in_npu_workflows']}",
-        f"- manual_review_needed: {summary['manual_review_needed']}",
-        f"- npu_only: {summary['npu_only']}",
+        (
+            "Within both UT Case Details and ST Case Details, cases are grouped into Matched Cases, "
+            "CPU/GPU-only Cases, NPU-only Cases, and Manual Review."
+        ),
+        "",
+        f"## Ignored Workflows ({len(report['ignored_workflows'])})",
         "",
     ]
-
-    sections = [
-        ("CPU/GPU Cases Covered by NPU", "aligned"),
-        ("CPU/GPU Cases Missing in NPU Workflows", "missing_in_npu_workflows"),
-        ("Cases Requiring Manual Review", "manual_review_needed"),
-        ("NPU-only Cases", "npu_only"),
+    ignored_rows = [[path] for path in report["ignored_workflows"]]
+    if ignored_rows:
+        lines.extend(render_table(["Workflow Name"], ignored_rows))
+    else:
+        lines.append("No workflows were ignored.")
+    lines.extend(
+        [
+            "",
+            "## Scanned Workflows",
+            "",
+        ]
+    )
+    scanned_rows = [
+        [
+            row["workflow_name"],
+            str(row["cpu_gpu_case_count"]),
+            str(row["npu_supported_case_count"]),
+        ]
+        for row in report["scanned_workflows"]
     ]
-
-    for title, category in sections:
-        lines.append(f"## {title}")
-        lines.append("")
-        items = by_category.get(category, [])
-        if not items:
-            lines.append("- None")
-            lines.append("")
-            continue
-        for item in items:
-            lines.append(f"- `{item['target']}`")
-            lines.append(f"  - Original file location: `{item['target']}`")
-            lines.append(f"  - Difference: {item['reason']}")
-            if item["signature"]:
-                lines.append(f"  - Signature summary: `{item['signature']}`")
-            if category == "manual_review_needed":
-                lines.extend(render_manual_review_block(item))
-            else:
-                lines.extend(render_ref_block("CPU/GPU case locations", item["cpu_gpu_refs"]))
-                lines.extend(render_ref_block("NPU case locations", item["npu_refs"]))
-        lines.append("")
+    if scanned_rows:
+        lines.extend(
+            render_table(
+                ["Workflow Name", "CPU/GPU Case Count", "NPU Supported Case Count"],
+                scanned_rows,
+            )
+        )
+    else:
+        lines.append("No workflows were scanned.")
+    lines.extend(["", *render_details_block("UT Case Details", report["ut_details"])])
+    lines.extend(["", *render_details_block("ST Case Details", report["st_details"])])
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -632,12 +880,25 @@ def validate_repo_root(repo_root: Path) -> None:
         raise FileNotFoundError(f"Target repository root does not exist: {repo_root}")
     if not repo_root.is_dir():
         raise NotADirectoryError(f"Target repository root is not a directory: {repo_root}")
-
     workflow_dir = repo_root / ".github" / "workflows"
     if not workflow_dir.is_dir():
         raise FileNotFoundError(
             f"Target repository does not contain '.github/workflows'. Expected workflow directory: {workflow_dir}"
         )
+
+
+def build_report(repo_root: Path, config: WorkflowConfig) -> dict:
+    """Build the in-memory report data."""
+    workflow_infos, cases, ignored_paths = collect_scan_data(repo_root, config)
+    grouped_workflows = build_workflow_groups(workflow_infos)
+    return {
+        "repo_root": str(repo_root),
+        "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "ignored_workflows": ignored_paths,
+        "scanned_workflows": summarize_scanned_workflows(grouped_workflows, cases),
+        "ut_details": compare_cases_by_pair(cases, UT_KIND),
+        "st_details": compare_cases_by_pair(cases, ST_KIND),
+    }
 
 
 def main() -> int:
@@ -662,27 +923,8 @@ def main() -> int:
     validate_repo_root(repo_root)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    workflow_cases, workflow_sources = collect_workflow_cases(repo_root)
-    cpu_gpu_cases = [case for case in workflow_cases if case["workflow_kind"] in {"cpu", "gpu"}]
-    npu_cases = [case for case in workflow_cases if case["workflow_kind"] == "npu"]
-
-    case_items = compare_case_sets(cpu_gpu_cases, npu_cases)
-    items = sorted(case_items, key=lambda item: (item["category"], item["target"], item["id"]))
-
-    report = {
-        "repo_root": str(repo_root),
-        "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-        "scope": "workflow-case-diff",
-        "baseline": "cpu_gpu_workflow_union",
-        "sources": {
-            "workflows": workflow_sources,
-            "tests": ["tests/README.md"],
-            "docs": ["docs/ascend_tutorial/contribution_guide/ascend_ci_guide_zh.rst"],
-        },
-        "summary": build_summary(case_items, cpu_gpu_cases, npu_cases),
-        "items": items,
-    }
-
+    config = load_config()
+    report = build_report(repo_root, config)
     report_path = output_dir / "report.md"
     report_path.write_text(render_report(report), encoding="utf-8")
     print(report_path)

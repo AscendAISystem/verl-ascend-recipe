@@ -1,29 +1,36 @@
 ---
 name: ascend-ci-case-diff-scan
-description: Scan an external verl repository for Ascend/NPU CI coverage gaps by comparing CPU/GPU workflow-executed test cases against NPU/Ascend workflows. Use when Codex needs to audit CI parity, report missing Ascend coverage, or generate a Markdown report about workflow-level test execution differences. Ignore examples/ NPU shell scripts.
+description: Scan an external verl repository for Ascend/NPU CI coverage gaps by comparing CPU/GPU workflow cases against NPU workflows. Use when Codex needs to audit workflow and case-level parity or generate a Markdown report about workflow execution differences.
 ---
 
 # Ascend CI Case Diff Scan
 
+Use this skill from the current repository to audit Ascend CI coverage in a target `verl` repository.
+
 ## Overview
 
-Use this skill from the current repository to audit workflow-level Ascend CI coverage in a target `verl` repository.
+The scanner performs a static analysis of workflow files and reports:
 
-The skill focuses on two concrete checks:
+1. Which workflows are out of scope and excluded by configuration.
+2. Which CPU/GPU workflows are paired with NPU workflows.
+3. How many function-level UT cases and command-level ST cases each workflow contributes.
+4. Which cases are matched, missing, NPU-only, or need manual review.
 
-1. Compare CPU/GPU workflow-executed test cases against NPU/Ascend workflows and report which CPU/GPU cases are missing from NPU workflows.
+## Scope
 
-This skill is intentionally narrow:
+The scanner reads workflow `run:` commands as the source of truth.
 
-- Read workflow `run:` commands as the source of truth for executed cases.
-- Ignore `examples/**`, even if it contains NPU shell scripts.
+- Ignore `examples/**`.
 - Ignore commented workflow lines.
+- Ignore `cpu_unit_tests.yml` because it is treated as shared CPU/GPU/NPU baseline coverage, not an NPU-adaptation target.
 - Do not execute tests.
+- Do not expand GitHub Actions matrices.
+- Keep the final report in English only.
 
 ## Workflow
 
-1. Read [references/repo-signals.md](./references/repo-signals.md) to refresh the repo-specific rules and boundaries.
-2. Identify the target `verl` repository root you want to analyze, for example `{PATH}/verl`.
+1. Read [references/repo-signals.md](./references/repo-signals.md) to refresh repo-specific boundaries.
+2. Identify the target `verl` repository root, for example `{PATH}/verl`.
 3. Run the scanner from the current repository:
 
 ```shell
@@ -32,7 +39,7 @@ python .agent/skills/ascend-ci-case-diff-scan/scripts/scan_ascend_ci_case_diff.p
   --output-dir ./report/ascend-ci-case-diff-scan
 ```
 
-You can also use the explicit alias if it reads better in the prompt or command line:
+You can also use the alias:
 
 ```shell
 python .agent/skills/ascend-ci-case-diff-scan/scripts/scan_ascend_ci_case_diff.py \
@@ -40,14 +47,9 @@ python .agent/skills/ascend-ci-case-diff-scan/scripts/scan_ascend_ci_case_diff.p
   --output-dir ./report/ascend-ci-case-diff-scan
 ```
 
-4. Summarize the highest-signal gaps first:
-   - CPU/GPU cases missing in NPU workflows
-   - anything routed to `manual_review_needed`
-   - relevant NPU-only coverage worth noting
+## Extraction Rules
 
-## Case Extraction Rules
-
-Treat workflow `run:` blocks as the only execution source. Extract only:
+Recognize only workflow commands that visibly execute tests:
 
 - `pytest ... tests/...`
 - `bash tests/.../*.sh`
@@ -64,7 +66,8 @@ For each extracted case, preserve:
 - `raw_command`
 - `signature`
 
-Use `signature` to keep meaningful env/parameter prefixes such as `ROLLOUT_NAME=sglang` or `ENGINE=sglang`. If two workflows hit the same target with different signatures, prefer `manual_review_needed` over assuming parity.
+When the same command is repeated, keep cases distinct by `workflow_name`, `job_name`, and `step_name`.
+For UT expansion, treat Python test functions and `Test*::test_*` methods as the reporting unit whenever the target file can be parsed.
 
 ## Classification Rules
 
@@ -75,19 +78,21 @@ Use these output categories:
 - `manual_review_needed`
 - `npu_only`
 
-Interpret them conservatively:
+Treat matching conservatively:
 
-- `aligned`: CPU/GPU workflow case also appears in an NPU workflow with the same target and compatible signature.
-- `missing_in_npu_workflows`: CPU/GPU workflow case has no NPU workflow match.
-- `manual_review_needed`: same target exists but signatures differ, or the command cannot be matched safely.
-- `npu_only`: case exists only in NPU workflows.
+- Exact target matches are the strongest signal.
+- Compatible signatures can be aligned.
+- Different signatures for the same target should fall back to manual review.
 
 ## Reporting
 
-The scanner writes output into the current repository's `--output-dir` and reads workflows from the external target repository passed by `--repo-root` / `--target-repo-root`.
+The scanner writes `report.md` to the requested output directory.
 
-The scanner writes:
+The report contains:
 
-- `report.md`
+- ignored workflows
+- scanned workflows with CPU/GPU and NPU case counts
+- UT details
+- ST details
 
-Keep the human summary short and useful. Lead with missing NPU workflow coverage, then mention aligned coverage, manual-review cases, and relevant NPU-only coverage.
+Within the UT and ST sections, matched, CPU/GPU-only, NPU-only, and manual-review cases are shown in that order, with CPU/GPU and NPU references adjacent for easier comparison.

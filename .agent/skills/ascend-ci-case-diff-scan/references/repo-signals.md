@@ -5,29 +5,29 @@ Use these target-repo facts when running `ascend-ci-case-diff-scan` against an e
 ## Primary inputs
 
 - `.github/workflows/*.yml`
-- `tests/README.md`
-- `docs/ascend_tutorial/contribution_guide/ascend_ci_guide_zh.rst`
+
+## Workflow scope
+
+Exclude workflows that are not part of CPU/GPU/NPU test coverage. The default ignored set is maintained in `config/workflow_scope.json`.
+
+Examples:
+
+- `check-pr-title.yml`
+- `cpu_unit_tests.yml`
+- `doc.yml`
+- `docker-*.yml`
+- `pre-commit.yml`
+- `precommit-autofix.yml`
+- `sanity.yml`
+- `scorecard.yml`
+- `secrets_scan.yml`
+- `type-coverage-check.yml`
 
 ## Workflow families
 
-- CPU workflows include `cpu_unit_tests.yml`.
-- GPU workflows are test workflows that are not Ascend workflows.
-- NPU workflows usually end with `_ascend.yml`, or clearly run on Ascend runners / Ascend images.
-
-Examples typically present in the target `verl` repository:
-
-- `reward_model_sglang.yml` and `reward_model_sglang_ascend.yml`
-- `model.yml` and `model_ascend.yml`
-- `e2e_sft_llm.yml` and `e2e_sft_llm_ascend.yml`
-- `e2e_ascend.yml`
-- `nightly_ascend.yml`
-- `npu_unit_tests.yml`
-
-## Ignore rules
-
-- Ignore `examples/**` completely for this skill.
-- Ignore commented workflow commands.
-- Ignore non-test workflows such as `doc.yml`, `sanity.yml`, `check-pr-title.yml`, `pre-commit.yml`, `precommit-autofix.yml`, `secrets_scan.yml`, `scorecard.yml`, and similar policy/docs workflows.
+- `foo.yml` pairs with `foo_ascend.yml`
+- `gpu_unit_tests.yml` pairs with `npu_unit_tests.yml`
+- Standalone NPU workflows such as `e2e_ascend.yml` and `nightly_ascend.yml` are treated as NPU-only unless a matching CPU/GPU workflow exists
 
 ## Extractable command forms
 
@@ -38,9 +38,9 @@ Recognize only workflow commands that visibly execute tests:
 - `torchrun ... tests/...`
 - `torchrun ... -m pytest tests/...`
 
-This skill is static. It does not expand matrices, infer hidden includes, or execute shell scripts.
-
 ## Matching expectations
 
 - Exact target matches are the strongest signal.
-- Same target with materially different env/argument prefixes should usually become `manual_review_needed`.
+- Same target with materially different env or argument prefixes should usually become `manual_review_needed`.
+- Repeated commands should remain distinct when they appear in different workflow, job, or step contexts.
+- For UT, prefer function-level or test-method-level comparison over file-level comparison because broad `pytest tests/...` commands and `--ignore-glob` options can hide partial support.

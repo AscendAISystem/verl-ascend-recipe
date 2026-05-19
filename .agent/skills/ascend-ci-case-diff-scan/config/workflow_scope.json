@@ -1,0 +1,14 @@
+{
+  "ignored_workflows": [
+    "check-pr-title.yml",
+    "cpu_unit_tests.yml",
+    "doc.yml",
+    "docker-*.yml",
+    "pre-commit.yml",
+    "precommit-autofix.yml",
+    "sanity.yml",
+    "scorecard.yml",
+    "secrets_scan.yml",
+    "type-coverage-check.yml"
+  ]
+}

@@ -331,7 +331,7 @@ class MMActorRolloutRefWorker(ActorRolloutRefWorker):
                 vision_tower.requires_grad_(False)
                 self.use_orig_params = True
                 if self.rank == 0:
-                    print("[actor model] Vision tower is set to not trainable.")
+                    logger.info("[actor model] Vision tower is set to not trainable.")
             else:
                 if self.rank == 0:
                     logger.info("[actor model] No vision tower found.")

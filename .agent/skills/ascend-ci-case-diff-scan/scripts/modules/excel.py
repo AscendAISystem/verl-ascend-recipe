@@ -291,14 +291,12 @@ def _xml_text(value: str) -> str:
 
 
 def _past_summary_rows(report: dict) -> list[list[object]]:
-    rows = [["Case Kind", "Workflow", "NPU Status", "Case Count", "Commit Count"]]
+    rows = [["CPU/GPU and NPU Not Fully Aligned Cases", "UT Gap Count", "ST Gap Count"]]
     rows.extend(
         [
-            row["case_kind"],
-            row["workflow_name"],
-            row["npu_status"],
-            row["case_count"],
-            row["commit_count"],
+            row["affected_path"],
+            row["ut_gap_count"],
+            row["st_gap_count"],
         ]
         for row in report["summary"]
     )
@@ -311,16 +309,14 @@ def _past_detail_rows(report: dict) -> list[list[object]]:
             "Commit Hash",
             "Commit Time",
             "Commit Title",
-            "Changed Files",
-            "Case Kind",
-            "Case Name",
-            "NPU Status",
-            "Workflow Name",
-            "Workflow Path",
-            "Job Name",
-            "Step Name",
+            "Effective Changed Files",
+            "Affected Path",
             "Line Number",
-            "Raw Command",
+            "Workflow Context",
+            "Source Type",
+            "Case Name",
+            "Case Kind",
+            "NPU Status",
         ]
     ]
     for row in report["details"]:
@@ -329,16 +325,14 @@ def _past_detail_rows(report: dict) -> list[list[object]]:
                 row["commit_hash"],
                 row["commit_time"],
                 row["commit_title"],
-                _excel_multiline("<br>".join(row["changed_files"])),
-                row["case_kind"],
-                row["case_name"],
-                row["npu_status"],
-                row["workflow_name"],
-                row["workflow_path"],
-                row["job_name"],
-                row["step_name"],
+                _excel_multiline("<br>".join(row["effective_changed_files"])),
+                row["affected_path"],
                 row["line_number"],
-                row["raw_command"],
+                row["workflow_context"],
+                row["source_type"],
+                row["case_name"],
+                row["case_kind"],
+                row["npu_status"],
             ]
         )
     return rows

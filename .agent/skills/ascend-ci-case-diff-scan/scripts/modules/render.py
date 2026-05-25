@@ -17,7 +17,13 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
 from itertools import zip_longest
+
+
+def markdown_multiline(value: str) -> str:
+    """Render internal multiline markers without relying on embedded HTML."""
+    return value.replace("<br>", "; ")
 
 
 def render_reference_details(indent: str, label: str, ref: dict | None) -> list[str]:
@@ -105,7 +111,7 @@ def render_report(report: dict) -> str:
     )
     scanned_rows = [
         [
-            row["workflow_name"],
+            markdown_multiline(row["workflow_name"]),
             str(row["cpu_gpu_case_count"]),
             str(row["npu_supported_case_count"]),
         ]
@@ -145,11 +151,20 @@ def render_past_commit_report(report: dict) -> str:
         "",
     ]
     summary_rows = [
-        [row["case_kind"], row["workflow_name"], row["npu_status"], str(row["case_count"]), str(row["commit_count"])]
+        [
+            row["affected_path"],
+            str(row["ut_gap_count"]),
+            str(row["st_gap_count"]),
+        ]
         for row in report["summary"]
     ]
     if summary_rows:
-        lines.extend(render_table(["Case Kind", "Workflow", "NPU Status", "Case Count", "Commit Count"], summary_rows))
+        lines.extend(
+            render_table(
+                ["CPU/GPU and NPU Not Fully Aligned Cases", "UT Gap Count", "ST Gap Count"],
+                summary_rows,
+            )
+        )
     else:
         lines.append("No CI-related commits were found in the selected window.")
     lines.extend(["", "## Commit Details", ""])
@@ -157,21 +172,41 @@ def render_past_commit_report(report: dict) -> str:
     if not details:
         lines.append("- None")
     else:
-        for row in details:
-            lines.append(f"- Commit `{row['commit_hash']}` - {row['commit_title']}")
-            lines.append(f"  - Time: `{row['commit_time']}`")
-            lines.append(f"  - Changed files: `{'<br>'.join(row['changed_files'])}`")
-            lines.append(f"  - Case: `{row['case_name']}`")
-            lines.append(f"  - Kind: `{row['case_kind']}`")
-            lines.append(f"  - Workflow: `{row['workflow_name']} / {row['job_name']} / {row['step_name']}`")
-            lines.append(f"  - Status: `{row['npu_status']}`")
-            if row["npu_refs"]:
-                lines.append("  - NPU refs:")
-                for ref in row["npu_refs"]:
-                    lines.append(
-                        f"    - `{ref['workflow_name']} / {ref['job_name']} / {ref['step_name']}` "
-                        f"`{ref['workflow_path']}` line `{ref['line_number']}`"
-                    )
-            else:
-                lines.append("  - NPU refs: None")
+        for commit_hash, commit_rows in _group_rows_by_commit(details).items():
+            first = commit_rows[0]
+            lines.append(f"- Commit `{first['commit_hash']}` - {first['commit_title']}")
+            lines.append(f"  - Time: `{first['commit_time']}`")
+            lines.append("  - Effective changed files:")
+            for changed_file in first["effective_changed_files"]:
+                lines.append(f"    - `{changed_file}`")
+            lines.append("  - Cases:")
+            for row in commit_rows:
+                lines.append(f"    - Case: `{row['case_name']}`")
+                lines.append(f"      - Kind: `{row['case_kind']}`")
+                lines.append(f"      - Affected path: `{row['affected_path']}`")
+                lines.append(f"      - Line number: `{row['line_number']}`")
+                lines.append(f"      - Workflow context: `{row['workflow_context']}`")
+                lines.append(f"      - Source type: `{row['source_type']}`")
+                lines.append(f"      - Status: `{row['npu_status']}`")
+                if row["npu_refs"]:
+                    lines.append("      - NPU refs:")
+                    for ref in row["npu_refs"]:
+                        lines.append(
+                            f"        - `{ref['workflow_name']} / {ref['job_name']} / {ref['step_name']}` "
+                            f"`{ref['workflow_path']}` line `{ref['line_number']}`"
+                        )
+                else:
+                    lines.append("      - NPU refs: None")
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _group_rows_by_commit(details: list[dict]) -> dict[str, list[dict]]:
+    grouped: dict[str, list[dict]] = defaultdict(list)
+    for row in details:
+        grouped[row["commit_hash"]].append(row)
+    return dict(
+        sorted(
+            grouped.items(),
+            key=lambda item: (item[1][0]["commit_time"], item[0]),
+        )
+    )

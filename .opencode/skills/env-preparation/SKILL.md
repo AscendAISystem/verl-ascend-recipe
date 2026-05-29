@@ -212,7 +212,7 @@ fi
 
 # 6.4 无冲突，正常创建
 # 更新启动脚本中的容器名
-sed -i "s/:\${VERL_CONTAINER:=.*}/:\${VERL_CONTAINER:=\"${VERL_CONTAINER}\"}/" ${VERL_WORK_DIR}/start_verl_docker.sh
+sed -i 's/:\${VERL_CONTAINER:=.*}/:\${VERL_CONTAINER:="'"${VERL_CONTAINER}"'"}/' ${VERL_WORK_DIR}/start_verl_docker.sh
 
 # 启动新容器
 bash ${VERL_WORK_DIR}/start_verl_docker.sh

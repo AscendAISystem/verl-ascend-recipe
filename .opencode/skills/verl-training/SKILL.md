@@ -416,7 +416,11 @@ todowrite: content="Step 6.6: 构建Docker命令" status="in_progress"
 
 ```bash
 docker exec $VERL_CONTAINER bash -c "mkdir -p /workspace/logs"
-LOG_FILE=/workspace/logs/${MODEL_NAME}_${ALGORITHM}_${DATASET_NAME}_$(date +%Y%m%d_%H%M%S).log
+LOG_FILE_NAME=${MODEL_NAME}_${ALGORITHM}_${DATASET_NAME}_$(date +%Y%m%d_%H%M%S).log
+HOST_LOG_FILE=${VERL_WORK_DIR}/logs/${LOG_FILE_NAME}
+CONTAINER_LOG_FILE=/workspace/logs/${LOG_FILE_NAME}
+
+DOCKER_CMD="docker exec $VERL_CONTAINER bash -c"
 
 DOCKER_CMD="docker exec $VERL_CONTAINER bash -c"
 

@@ -493,7 +493,7 @@ ENFORCE_CHECK:
 训练过程中提供以下命令查看进度：
 ```bash
 # 查看最新日志
-tail -f $LOG_FILE
+tail -f $HOST_LOG_FILE
 
 # 过滤关键指标
 tail -f $LOG_FILE | grep -E "(Epoch|Step|Loss|Reward|accuracy)"

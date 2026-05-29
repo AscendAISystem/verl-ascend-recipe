@@ -97,7 +97,7 @@ else
 fi
 
 # ModelScope下载
-timeout 7200 $DOCKER_CMD modelscope download --model ${MODEL_ID} --local_dir /models/MODEL_NAME
+timeout 7200 $DOCKER_CMD modelscope download --model ${MODEL_ID} --local_dir /models/${MODEL_NAME}
 
 # HuggingFace下载
 timeout 7200 $DOCKER_CMD hf download ${MODEL_ID} --local-dir /models/MODEL_NAME

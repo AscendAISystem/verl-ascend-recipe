@@ -129,10 +129,12 @@ else
     docker exec ${VERL_CONTAINER} mkdir -p /datasets/${DATASET_NAME}
   fi
   # 确定脚本名称（部分数据集需要特殊映射）
-  case "$DATASET_NAME" in
+  # 统一将数据集名称转换为小写并替换连字符为下划线，以提高兼容性
+  NORM_DATASET_NAME=$(echo "$DATASET_NAME" | tr 'A-Z-' 'a-z_')
+  case "$NORM_DATASET_NAME" in
     dapo_math_17k) SCRIPT_NAME="dapo_multiturn_w_tool.py" ;;
     aime_2024) SCRIPT_NAME="aime2024_multiturn_w_tool.py" ;;
-    *) SCRIPT_NAME="${DATASET_NAME}.py" ;;
+    *) SCRIPT_NAME="${NORM_DATASET_NAME}.py" ;;
   esac
   # 执行数据处理
   timeout 7200 $DOCKER_CMD python3 /verl/examples/data_preprocess/${SCRIPT_NAME} --local_save_dir /datasets/${DATASET_NAME}

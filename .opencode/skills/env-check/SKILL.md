@@ -88,7 +88,8 @@ ${DOCKER_CMD} which modelscope || \
 
 ```bash
 # OS版本
-${DOCKER_CMD} cat /etc/os-release | grep PRETTY_NAME
+# OS版本
+${DOCKER_CMD} bash -c "cat /etc/os-release | grep PRETTY_NAME"
 
 # Python版本
 ${DOCKER_CMD} python3 --version
